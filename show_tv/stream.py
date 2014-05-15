@@ -47,6 +47,7 @@ def main():
             refname = rname
             
             stop_signal = False
+            ad = None
         return chunk_range
         
     cr_dct = {}
@@ -61,23 +62,27 @@ def main():
     else:
         out_dir = "/home/ilil/show_tv/out_dir"
 
-    def chunk_fpath(chunk_dir, *fname):
+    def out_fpath(chunk_dir, *fname):
         return o_p.join(out_dir, chunk_dir, *fname)
 
     def remove_chunks(rng, cr):
         for i in rng:
-            fname = chunk_fpath(cr.refname, chunk_name(i))
+            fname = out_fpath(cr.refname, chunk_name(i))
             os.unlink(fname)
             
+    def ready_chk_end(chunk_range):
+        return chunk_range.end-1
     def ready_chunks(chunk_range):
         """ Кол-во дописанных до конца фрагментов """
-        return chunk_range.end - chunk_range.beg - 1
+        return ready_chk_end(chunk_range) - chunk_range.beg
+    def written_chunks(chunk_range):
+        return range(chunk_range.beg, ready_chk_end(chunk_range))
     
     def may_serve_pl(cnt):
-        return cnt >= 1
+        return cnt >= 2
 
     def channel_dir(chunk_dir):
-        return chunk_fpath(chunk_dir)
+        return out_fpath(chunk_dir)
     
     def run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking, is_batch=False):
         o_p.force_makedirs(channel_dir(chunk_dir))
@@ -90,7 +95,7 @@ def main():
         # :TRICKY: так отлавливаем сообщение от segment.c вида "starts with packet stream"
         log_type = "debug"
         in_opts = "-i " + src_media_path
-        emulate_live  = False # True # 
+        emulate_live  = True # False # 
         if IsTest and emulate_live and not is_batch:
             # эмулируем выдачу видео в реальном времени
             in_opts = "-re " + in_opts
@@ -100,7 +105,7 @@ def main():
             #cmd += " -segment_list %(out_dir)s/playlist.m3u8" % locals()
             pass
 
-        cmd += " %s" % chunk_fpath(chunk_dir, chunk_tmpl)
+        cmd += " %s" % out_fpath(chunk_dir, chunk_tmpl)
         #print(cmd)
         
         import tornado.process
@@ -170,8 +175,12 @@ def main():
         
         return ffmpeg_proc.pid
 
-    def test_src_path():
-        return list_bl_tv.make_path("pervyj.ts") # o_p.join(prefix_dir, 'show_tv/pervyj.ts')
+    def test_src_fpath(fname):
+        return out_fpath(o_p.join('../test_src', fname))
+    
+    def test_media_path():
+        #return list_bl_tv.make_path("pervyj.ts")
+        return test_src_fpath("pervyj-720x406.ts")
 
     main.stop_streaming = False
     def start_chunking(chunk_range):
@@ -184,7 +193,6 @@ def main():
         chunk_range.beg = 0
         chunk_range.end = 0
         chunk_range.start_times = []
-        chunk_range.ad = None
 
         def on_new_chunk(chunk_dur):
             chunk_range.start_times.append(chunk_dur)
@@ -205,10 +213,17 @@ def main():
                 chunk_range.beg += diff
                 del chunk_range.start_times[:diff]
                 remove_chunks(range(old_beg, chunk_range.beg), chunk_range)
+                
+                ad = chunk_range.ad
+                if ad and not is_before_ad_end(chunk_range.beg, ad):
+                    clear_ad(chunk_range)
+                    
      
         def on_stop_chunking():
             chunk_range.is_started = False
             remove_chunks(range(chunk_range.beg, chunk_range.end), chunk_range)
+            if chunk_range.ad:
+                clear_ad(chunk_range)
 
             may_restart = not chunk_range.stop_signal
             if chunk_range.stop_signal:
@@ -224,7 +239,7 @@ def main():
                     start_chunking(chunk_range)
                     
         if IsTest:
-            src_media_path = test_src_path()
+            src_media_path = test_media_path()
         else:
             src_media_path = rn_dct[refname]
         
@@ -233,12 +248,13 @@ def main():
     #
     # выдача
     #
-    def written_chunks(chunk_range):
-        return range(chunk_range.beg, chunk_range.end-1)
     def chunk_duration(i, chunk_range):
         i -= chunk_range.beg
         st = chunk_range.start_times
         return st[i+1] - st[i]
+
+    def is_before_ad_end(i, ad):
+        return i < ad.idx + len(ad.times)
 
     def serve_pl(hdl, chunk_range):
         # :TRICKY: по умолчанию tornado выставляет
@@ -248,36 +264,59 @@ def main():
         # Safari/IPad такое не принимает (да и Firefox/Linux тоже)
         hdl.set_header("Content-Type", "application/vnd.apple.mpegurl")
         
+        req = hdl.request
+        ad = chunk_range.ad
+        if ad:
+            is_first_ad = 'Ios-Device-Info' in req.headers
+            out_ad = ad if is_first_ad else ad.other_ad
+        
         write = hdl.write
         # EXT-X-TARGETDURATION - должен быть, и это
         # должен быть максимум
         max_dur = 0
+        chunk_lst = []
         for i in written_chunks(chunk_range):
-            max_dur = max(chunk_duration(i, chunk_range), max_dur)
+            if ad and i >= ad.idx and is_before_ad_end(i, ad):
+                idx = i - ad.idx
+                dur = out_ad.times[idx]
+                name = chunk_name(phis_ad_i(idx))
+                name = "/%(out_ad.chunk_dir)s/%(name)s" % s_.EvalFormat()
+                
+                # :TRICKY: VLC не умеет обрабатывать абсолютные пути ("/..."),
+                # научится с `git tag -l --contains 1abf871c` >= 2.1,
+                # поэтому посылаем полный путь
+                # другие:
+                # - iOS: умеет
+                # - Totem: не умеет
+                import urllib.parse
+                name = urllib.parse.urljoin(req.full_url(), name)
+            else:
+                dur = chunk_duration(i, chunk_range)
+                name = chunk_name(i)
+            
+            max_dur = max(dur, max_dur)
+            
+            # используем %f (6 знаков по умолчанию) вместо %s, чтобы на 
+            # '%s' % 0.0000001 не получать '1e-07'
+            chunk_lst.append("""#EXTINF:%(dur)f,
+%(name)s
+""" % locals())
+
         # по спеке это должно быть целое число, иначе не работает (IPad)
         max_dur = int_ceil(max_dur)
         
         # EXT-X-MEDIA-SEQUENCE - номер первого сегмента,
         # нужен для указания клиенту на то, что список живой,
         # т.е. его элементы будут добавляться/исчезать по FIFO
-        #
-        # если chunk_range не использовать здесь, то EvalFormat 
-        # его не найдет; неиспользуемые неглобальные функции - аналогично
-        beg = chunk_range.beg
         write("""#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-ALLOW-CACHE:NO
 #EXT-X-TARGETDURATION:%(max_dur)s
-#EXT-X-MEDIA-SEQUENCE:%(beg)s
+#EXT-X-MEDIA-SEQUENCE:%(chunk_range.beg)s
 """ % s_.EvalFormat())
                 
-        for i in written_chunks(chunk_range):
-            name = chunk_name(i)
-            # используем %f (6 знаков по умолчанию) вместо %s, чтобы на 
-            # '%s' % 0.0000001 не получать '1e-07'
-            write("""#EXTINF:%(chunk_duration(i, chunk_range))f,
-%(name)s
-""" % s_.EvalFormat())
+        for s in chunk_lst:
+            write(s)
             
         # а вот это для live не надо
         #write("#EXT-X-ENDLIST")
@@ -340,54 +379,122 @@ def main():
     def remove_ad(chunk_dir):
         o_p.del_any_fpath(channel_dir(chunk_dir))
     
+    # закончилась реклама
+    def clear_ad(chunk_range):
+        remove_ad(chunk_range.ad.chunk_dir)
+        remove_ad(chunk_range.ad.other_ad.chunk_dir)
+        chunk_range.ad = None
+
+    def phis_ad_i(i):
+        return i+1
+     
     ad_s_prefix = "ad/static"
     import t_
     def get_run_ad(hdl):
         refname = hdl.get_argument("channel")
         chunk_range = get_cr(refname)
         
-        pr = ad_s_prefix
-        ts = t_.utcnow_str().replace(":", "-") # чтоб с портом никто не спутал
-        dir_prefix = "%(pr)s/%(ts)s_%(refname)s" % locals()
-        
-        idx = 0
-        while True:
-            chunk_dir = "%(dir_prefix)s-%(idx)s" % locals() if idx else dir_prefix
-            if o_p.exists(channel_dir(chunk_dir)):
-                idx += 1
-            else:
-                break
-        
-        # :TRICKY: длительность последнего сегмента невозможно вычислить, потому что
-        # ffmpeg не выводит это в stderr - последний chunk не показываем
-        # :TRICKY: если "посередине" остановить сервер, то не будут удалены временные
-        # файлы рекламы - фиг с ними, тем более не решено пока, один и тот же процесс
-        # будет управлять и каналами, и контентом рекламы, или нет
-        start_times = []
-        def on_new_chunk(chunk_dur):
-            start_times.append(chunk_dur)
-        def on_stop_chunking():
-            res, err_msg = False, "Uknown error"
-            if not start_times:
-                err_msg = "Bad ad source"
-            elif not force_chunking(chunk_range):
-                err_msg = "force_chunking() failed"
-            else:
-                res = True
-                chunk_range.ad = make_struct(
-                    chunk_dir   = chunk_dir,
-                    start_times = start_times,
-                    idx         = chunk_range.end-1
-                )
+        # :TODO: параметр к запросу
+        duration = "12" # секунд
+        # число в фрагментах
+        dur_cnt = int(round(float(duration)/std_chunk_dur))
+
+        # :REFACTOR:
+        end_set = set([True, False])
+        results = {}
+        def prepare_ad(is_first):
+            pr, rn = ad_s_prefix, refname
+            ts = t_.utcnow_str().replace(":", "-") # чтоб с портом никто не спутал
+            dir_prefix = "%(pr)s/%(ts)s_%(rn)s_%(is_first)s" % locals()
+            
+            idx = 0
+            while True:
+                chunk_dir = "%(dir_prefix)s-%(idx)s" % locals() if idx else dir_prefix
+                if o_p.exists(channel_dir(chunk_dir)):
+                    idx += 1
+                else:
+                    break
+            
+            # :TRICKY: длительность последнего сегмента невозможно вычислить, потому что
+            # ffmpeg не выводит это в stderr - последний chunk не показываем
+            # :TRICKY: если "посередине" остановить сервер, то не будут удалены временные
+            # файлы рекламы - фиг с ними, тем более не решено пока, один и тот же процесс
+            # будет управлять и каналами, и контентом рекламы, или нет
+            start_times = []
+            def on_new_chunk(chunk_dur):
+                start_times.append(chunk_dur)
+            def on_stop_chunking():
+                # :TODO: refactor
+                res, err_msg = False, "Uknown error"
+                if not start_times:
+                    err_msg = "Bad ad source"
+                else:
+                    # первый - неровный обычно, последний - не до конца
+                    if len(start_times) < dur_cnt + 2:
+                        err_msg = "Too short ad duration: %s" % len(start_times)
+                    else:
+                        times = []
+                        total = 0
+                        for i in range(dur_cnt):
+                            dur = start_times[phis_ad_i(i+1)] - start_times[phis_ad_i(i)]
+                            total += dur
+                            times.append(dur)
+                            
+                        if total < dur_cnt * std_chunk_dur - 0.5:
+                            err_msg = "Too short ad chunks: %s" % total
+                        else:
+                            res = True
+                
+                if res:
+                    ad = make_struct(
+                        chunk_dir = chunk_dir,
+                        times     = times,
+                    )
+                else:
+                    ad = None
+                    remove_ad(chunk_dir)
+                    
+                results[is_first] = ad, err_msg
+                    
+                end_set.discard(is_first)
+                if not end_set:
+                    on_ad_ready()
+                
+            ad_name = 'rbktv-720x406.ts' if is_first else 'rbktv2-720x406.ts'
+            src_media_path = test_src_fpath(ad_name) # test_media_path()
+            run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking, is_batch=True)
+            
+        for is_first in end_set:
+            prepare_ad(is_first)
+            
+        def on_ad_ready():
+            res, err_msg = True, "Uknown error"
+            for is_first in [True, False]:
+                ad, msg = results[is_first]
+                if not ad:
+                    res = False
+                    err_msg = "[%s] %s" % (is_first, msg)
+                    break
+                    
+            if res:
+                res = False
+                
+                if not force_chunking(chunk_range):
+                    err_msg = "force_chunking() failed"
+                elif chunk_range.ad:
+                    err_msg = "More than one ad at a time"
+                else:
+                    # :TODO: refactor
+                    ad = results[True][0]
+                    ad.idx = ready_chk_end(chunk_range)
+                    ad.other_ad = results[False][0]
+                    chunk_range.ad = ad
+                    
+                    res = True
             
             hdl.write("Ok" if res else err_msg)
             hdl.finish()
-            if not res:
-                remove_ad(chunk_dir)
             
-        src_media_path = test_src_path()
-        run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking, is_batch=True)
-    
     handlers.extend([
         make_get_handler(r"/ad/run", get_run_ad),
         make_static_handler(ad_s_prefix), # пример: /ad/static/2013-09-08T17:24:38.383278Z_ntv/out00000000.ts
