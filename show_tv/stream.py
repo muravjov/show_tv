@@ -14,6 +14,21 @@ PORT = 8910
 def int_ceil(float_):
     return int(math.ceil(float_))
 
+# объект самого класса object минималистичен, поэтому не содержит
+# __dict__ (который и дает функционал атрибутов); а вот наследники
+# получают __dict__ по умолчанию, если только в их описании нет __slots__ - 
+# явного списка атрибутов, которые должен иметь класс
+class Struct(object):
+    pass
+
+def make_struct(**kwargs):
+    """ Сделать объект с атрибутами """
+    # вообще, для спец. случаев, требующих оптимизации по памяти, можно
+    # установить __slots__ равным kwargs.keys()
+    stct = Struct()
+    stct.__dict__.update(kwargs)
+    return stct
+
 def main():
     rn_dct = get_channels()[0]
     # в Bradbury обычно 12 секунд GOP
@@ -25,6 +40,7 @@ def main():
         return chunk_tmpl % i
 
     def make_cr(rname):
+        # :REFACTOR: make_struct()
         class chunk_range:
             is_started = False
             on_first_chunk_handlers = []
@@ -63,7 +79,7 @@ def main():
     def channel_dir(chunk_dir):
         return chunk_fpath(chunk_dir)
     
-    def run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking):
+    def run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking, is_batch=False):
         o_p.force_makedirs(channel_dir(chunk_dir))
         
         if IsTest:
@@ -75,7 +91,7 @@ def main():
         log_type = "debug"
         in_opts = "-i " + src_media_path
         emulate_live  = False # True # 
-        if emulate_live and IsTest:
+        if IsTest and emulate_live and not is_batch:
             # эмулируем выдачу видео в реальном времени
             in_opts = "-re " + in_opts
         bl_options = "-segment_time %s" % std_chunk_dur
@@ -154,6 +170,9 @@ def main():
         
         return ffmpeg_proc.pid
 
+    def test_src_path():
+        return list_bl_tv.make_path("pervyj.ts") # o_p.join(prefix_dir, 'show_tv/pervyj.ts')
+
     main.stop_streaming = False
     def start_chunking(chunk_range):
         if main.stop_streaming:
@@ -165,6 +184,7 @@ def main():
         chunk_range.beg = 0
         chunk_range.end = 0
         chunk_range.start_times = []
+        chunk_range.ad = None
 
         def on_new_chunk(chunk_dur):
             chunk_range.start_times.append(chunk_dur)
@@ -204,15 +224,18 @@ def main():
                     start_chunking(chunk_range)
                     
         if IsTest:
-            src_media_path = list_bl_tv.make_path("pervyj.ts") # o_p.join(prefix_dir, 'show_tv/pervyj.ts')
+            src_media_path = test_src_path()
         else:
             src_media_path = rn_dct[refname]
         
         chunk_range.pid = run_chunker(src_media_path, chunk_range.refname, on_new_chunk, on_stop_chunking)
     
+    #
+    # выдача
+    #
     def written_chunks(chunk_range):
         return range(chunk_range.beg, chunk_range.end-1)
-    def chunk_dur(i, chunk_range):
+    def chunk_duration(i, chunk_range):
         i -= chunk_range.beg
         st = chunk_range.start_times
         return st[i+1] - st[i]
@@ -230,7 +253,7 @@ def main():
         # должен быть максимум
         max_dur = 0
         for i in written_chunks(chunk_range):
-            max_dur = max(chunk_dur(i, chunk_range), max_dur)
+            max_dur = max(chunk_duration(i, chunk_range), max_dur)
         # по спеке это должно быть целое число, иначе не работает (IPad)
         max_dur = int_ceil(max_dur)
         
@@ -252,7 +275,7 @@ def main():
             name = chunk_name(i)
             # используем %f (6 знаков по умолчанию) вместо %s, чтобы на 
             # '%s' % 0.0000001 не получать '1e-07'
-            write("""#EXTINF:%(chunk_dur(i, chunk_range))f,
+            write("""#EXTINF:%(chunk_duration(i, chunk_range))f,
 %(name)s
 """ % s_.EvalFormat())
             
@@ -261,9 +284,6 @@ def main():
         
         hdl.finish()
     
-    #
-    # выдача
-    #
     activity_set = set()
     
     import tornado.web
@@ -271,34 +291,107 @@ def main():
     
     def raise_error(status):
         raise tornado.web.HTTPError(status)
-    class PLHandler(tornado.web.RequestHandler):
-        @tornado.web.asynchronous
-        def get(self, refname):
-            chunk_range = cr_dct.get(refname)
-            if not chunk_range:
-                raise_error(404)
+    def make_get_handler(match_pattern, get_handler):
+        class Handler(tornado.web.RequestHandler):
+            pass
+        
+        Handler.get = tornado.web.asynchronous(get_handler)
+        return match_pattern, Handler
+
+    def get_cr(refname):
+        chunk_range = cr_dct.get(refname)
+        if not chunk_range:
+            raise_error(404)
+        return chunk_range
+    
+    def force_chunking(chunk_range):
+        if not chunk_range.is_started:
+            start_chunking(chunk_range)
             
-            is_started = chunk_range.is_started
-            if not is_started:
-                start_chunking(chunk_range)
-                # например, из-за сигнала остановить сервер
-                if not chunk_range.is_started:
-                    raise_error(503)
-                
-            if is_started and may_serve_pl(ready_chunks(chunk_range)):
-                serve_pl(self, chunk_range)
-            else:
-                chunk_range.on_first_chunk_handlers.append(functools.partial(serve_pl, self, chunk_range))
-                
-            activity_set.add(chunk_range.refname)
+        return chunk_range.is_started
+    
+    def get_playlist(hdl, refname):
+        chunk_range = get_cr(refname)
+        if not force_chunking(chunk_range):
+            # например, из-за сигнала остановить сервер
+            raise_error(503)
+            
+        if may_serve_pl(ready_chunks(chunk_range)):
+            serve_pl(hdl, chunk_range)
+        else:
+            chunk_range.on_first_chunk_handlers.append(functools.partial(serve_pl, hdl, chunk_range))
+            
+        activity_set.add(chunk_range.refname)
 
     handlers = [
-        (r"/([-\w]+)/playlist.m3u8", PLHandler),
+        make_get_handler(r"/([-\w]+)/playlist.m3u8", get_playlist),
     ]
+    def make_static_handler(chunk_dir):
+        return r"/%s/(.*)" % chunk_dir, tornado.web.StaticFileHandler, {"path": channel_dir(chunk_dir)}
+        
     for refname in rn_dct:
         handlers.append(
-            (r"/%s/(.*)" % refname, tornado.web.StaticFileHandler, {"path": channel_dir(refname)}),
+            make_static_handler(refname),
         )
+    
+    #
+    # вставка рекламы
+    #
+    def remove_ad(chunk_dir):
+        o_p.del_any_fpath(channel_dir(chunk_dir))
+    
+    ad_s_prefix = "ad/static"
+    import t_
+    def get_run_ad(hdl):
+        refname = hdl.get_argument("channel")
+        chunk_range = get_cr(refname)
+        
+        pr = ad_s_prefix
+        ts = t_.utcnow_str().replace(":", "-") # чтоб с портом никто не спутал
+        dir_prefix = "%(pr)s/%(ts)s_%(refname)s" % locals()
+        
+        idx = 0
+        while True:
+            chunk_dir = "%(dir_prefix)s-%(idx)s" % locals() if idx else dir_prefix
+            if o_p.exists(channel_dir(chunk_dir)):
+                idx += 1
+            else:
+                break
+        
+        # :TRICKY: длительность последнего сегмента невозможно вычислить, потому что
+        # ffmpeg не выводит это в stderr - последний chunk не показываем
+        # :TRICKY: если "посередине" остановить сервер, то не будут удалены временные
+        # файлы рекламы - фиг с ними, тем более не решено пока, один и тот же процесс
+        # будет управлять и каналами, и контентом рекламы, или нет
+        start_times = []
+        def on_new_chunk(chunk_dur):
+            start_times.append(chunk_dur)
+        def on_stop_chunking():
+            res, err_msg = False, "Uknown error"
+            if not start_times:
+                err_msg = "Bad ad source"
+            elif not force_chunking(chunk_range):
+                err_msg = "force_chunking() failed"
+            else:
+                res = True
+                chunk_range.ad = make_struct(
+                    chunk_dir   = chunk_dir,
+                    start_times = start_times,
+                    idx         = chunk_range.end-1
+                )
+            
+            hdl.write("Ok" if res else err_msg)
+            hdl.finish()
+            if not res:
+                remove_ad(chunk_dir)
+            
+        src_media_path = test_src_path()
+        run_chunker(src_media_path, chunk_dir, on_new_chunk, on_stop_chunking, is_batch=True)
+    
+    handlers.extend([
+        make_get_handler(r"/ad/run", get_run_ad),
+        make_static_handler(ad_s_prefix), # пример: /ad/static/2013-09-08T17:24:38.383278Z_ntv/out00000000.ts
+    ])
     
     application = tornado.web.Application(handlers)
     application.listen(PORT)
